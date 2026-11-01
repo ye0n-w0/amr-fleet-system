@@ -29,8 +29,9 @@ CPU_KPI_PCT = 80.0
 # 장기 대기 기준은 amr_fleet_manager fleet_metrics.ZONE_LONG_WAIT_S와 같다 (서버 release_timeout_s)
 ZONE_LONG_WAIT_S = 30.0
 COUNT_ZERO_KPI = ('fleet.zone_long_waits', 'fleet.stalls')
-# 시나리오가 일부러 만드는 상황이라 판정하면 오해되는 지표 (fleet_deadlock은 교착을 유도한다)
-NO_VERDICT = {'fleet_deadlock': set(COUNT_ZERO_KPI)}
+# 시나리오가 일부러 만드는 상황이라 판정하면 오해되는 지표 (fleet_deadlock은 교착을 유도한다.
+# yolo_fps는 로봇 1대의 카메라를 CPU로 렌더링하는 FPS 측정이라 CPU 80 % KPI의 조건이 아니다)
+NO_VERDICT = {'fleet_deadlock': set(COUNT_ZERO_KPI), 'yolo_fps': {'sys.cpu_pct.mean'}}
 # 작업 실패 원인 묶음 (ErrorInfo.code 대역, docs/api.md). 위치(203)를 주행(201·202)과 나눠 센다 (#148 지수 합의)
 FAILURE_CAUSES = {'localization': {'203'}, 'nav': {'201', '202'}, 'traffic': {'301', '302', '303'},
                   'comm': {'401', '402'}, 'task_timeout': {'501'}, 'charge': {'502'},
@@ -39,6 +40,9 @@ FAILURE_CAUSES = {'localization': {'203'}, 'nav': {'201', '202'}, 'traffic': {'3
 NAV_KPI = {'navkpi.plan_success_rate': (0.98, 'min'), 'navkpi.replan_p95_ms': (500.0, 'max'),
            'navkpi.pred_err_mean': (0.15, 'max'), 'navkpi.cte_straight_mean_m': (0.05, 'max'),
            'navkpi.cte_curve_mean_m': (0.10, 'max')}
+# 원 명세 AI 인지(6장) KPI "CPU 10 FPS" (yolo_fps, detection_fps.py): 클수록 좋아 CI 하한으로 판정한다 (NAV_KPI와 같은 형식).
+# "GPU 30 FPS"는 하네스 이미지·러너에 GPU가 없어 두지 않는다
+DETECT_KPI = {'detect.fps.mean': (10.0, 'min')}
 # 추적 정확도 KPI (docs/algorithms/perception.md 1-7): (기준, 방향). gt = 기준보다 커야 함 (CI 하한으로 판정).
 # P1은 0과 같아도 불합격이다 (추정 속도가 0이면 예측과 정지 가정이 같아진다). 장면 A·B·D·E에서만 판정한다
 TRACK_KPI = {'track.pred_gain_1s': (0.0, 'gt'), 'track.vel.rmse': (0.2, 'max')}
@@ -405,11 +409,31 @@ def tracking_metrics(run_dir: Path) -> dict[str, float]:
     return out
 
 
+def detection_metrics(run_dir: Path) -> dict[str, float]:
+    """detection/fps.json(tools/harness/detection_fps.py, yolo_fps) → detect.* 지표.
+
+    detect.fps.mean  측정 구간의 처리 FPS (발행 프레임 수 합 ÷ 실제 시간 합). KPI ≥ 10 (DETECT_KPI)
+    나머지는 참고 지표다: fps.min(가장 느린 5 s 구간), infer_ms.mean(추론), latency_ms.mean(촬영→발행, 시뮬레이션 시계),
+    frames·windows(표본 수), objects_per_frame, no_depth(깊이 없어 뺀 검출), tf_fail(TF 없어 버린 프레임). 값이 없으면 뺀다.
+    """
+    path = run_dir / 'detection' / 'fps.json'
+    if not path.exists():
+        return {}
+    d = json.loads(path.read_text(encoding='utf-8'))
+    out = {}
+    for key, name in (('fps_mean', 'fps.mean'), ('fps_min', 'fps.min'), ('infer_ms_mean', 'infer_ms.mean'),
+                      ('latency_ms_mean', 'latency_ms.mean'), ('frames', 'frames'), ('windows', 'windows'),
+                      ('objects_per_frame', 'objects_per_frame'), ('no_depth', 'no_depth'), ('tf_fail', 'tf_fail')):
+        if isinstance(d.get(key), (int, float)):
+            out[f'detect.{name}'] = float(d[key])
+    return out
+
+
 def run_metrics(run_dir: Path) -> dict[str, float]:
     meta = load_meta(run_dir)
     out = {**localization_metrics(run_dir), **fleet_metrics(run_dir), **nav_metrics(run_dir),
            **kidnap_metrics(run_dir), **nav_kpi_metrics(run_dir), **cpu_metrics(run_dir),
-           **avoidance_metrics(run_dir), **tracking_metrics(run_dir)}
+           **avoidance_metrics(run_dir), **tracking_metrics(run_dir), **detection_metrics(run_dir)}
     rtf = meta.get('real_time_factor')
     if isinstance(rtf, (int, float)):
         out['run.real_time_factor'] = float(rtf)
@@ -441,8 +465,8 @@ def kpi_verdict(metric: str, mean: float, ci_high: Optional[float], ci_low: Opti
         threshold = 0.0
     elif metric == 'sys.cpu_pct.mean':
         threshold = CPU_KPI_PCT
-    elif metric in NAV_KPI:
-        threshold, kind = NAV_KPI[metric]
+    elif metric in NAV_KPI or metric in DETECT_KPI:
+        threshold, kind = NAV_KPI.get(metric) or DETECT_KPI[metric]
         if kind == 'min':
             if ci_low is not None and ci_low >= threshold:
                 return 'PASS'
